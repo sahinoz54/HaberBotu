@@ -34,52 +34,41 @@ def keep_alive():
 model = None
 
 def setup_ai():
-    """Tüm modelleri tarar, 'exp' olmayanı bulur ve seçer."""
+    """Gemini modelini güvenli şekilde seçip kurar."""
     global model
     if not GEMINI_KEY:
         print("HATA: GEMINI_KEY Render ayarlarinda yok!")
+        model = None
         return
 
     try:
         genai.configure(api_key=GEMINI_KEY)
-        
-        print("Model aranıyor...")
-        found_model_name = None
 
-        # Hesabındaki tüm modelleri listele
-        for m in genai.list_models():
-            # Sadece metin üretebilenleri al
-            if 'generateContent' in m.supported_generation_methods:
-                name = m.name
-                # 'exp' veya 'experimental' yazanlar kota hatası verir, onları atla
-                if 'exp' in name.lower():
-                    continue
-                
-                # Flash veya Pro görürsen direkt kap
-                if 'flash' in name.lower() or 'pro' in name.lower():
-                    found_model_name = name
-                    break
-        
-        # Eğer yukarıdaki döngüde bulamazsa, exp olmayan ilk modeli al
-        if not found_model_name:
-             for m in genai.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    if 'exp' not in m.name.lower():
-                        found_model_name = m.name
-                        break
+        # Deneysel (exp) modelleri eledik, sadece kararlı olanlar
+        preferred = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
+        available = [
+            m.name for m in genai.list_models()
+            if "generateContent" in getattr(m, "supported_generation_methods", [])
+        ]
 
-        # Hâlâ bulamadıysa, varsayılanı zorla (son çare)
-        if not found_model_name:
-            found_model_name = "gemini-1.5-flash"
+        # Listeden exp olmayan, preferred içindeki ilk modeli seç
+        picked = next(
+            (a for p in preferred for a in available if p in a and "exp" not in a),
+            available[0] if available else None
+        )
 
-        print(f"✅ Seçilen Model: {found_model_name}")
-        model = genai.GenerativeModel(found_model_name)
+        if picked:
+            model = genai.GenerativeModel(picked)
+            print(f"Model kuruldu: {picked}")
+        else:
+            print("HATA: Uygun model bulunamadi.")
+            model = None
 
     except Exception as e:
-        print(f"Model Kurulum Hatası: {e}")
+        print(f"Model hatasi: {e}")
+        model = None
 
 def clean_claim(text: str) -> str:
-    """Mesajı iddiaya çevirir."""
     text = (text or "").strip()
     text = re.sub(r"\s+", " ", text)
     if len(text) > 200:
@@ -87,22 +76,42 @@ def clean_claim(text: str) -> str:
     return text
 
 def search_web(query):
-    """DDG ile arama."""
+    """FİLTRELİ ARAMA: Banka ve reklam sitelerini eler."""
     try:
         with DDGS() as ddgs:
+            # Sorguyu güçlendir
+            enhanced_query = f"{query} haber gerçek mi"
+            
             ddg_results = list(ddgs.text(
-                query,
+                enhanced_query,
                 region="tr-tr",
                 safesearch="moderate",
-                max_results=6
+                max_results=8
             ))
 
         results = []
+        
+        # --- YENİ EKLENEN FİLTRE BURASI ---
+        ignored_domains = [
+            "dcu.org", "apple.com", "google.com", "amazon.com", 
+            "trendyol.com", "hepsiburada.com", "sahibinden.com", 
+            "pinterest.com", "akakce.com", "cimri.com"
+        ]
+        # ----------------------------------
+
         for r in ddg_results:
             title = r.get("title", "")
             body = r.get("body", "")
             link = r.get("href") or r.get("link") or ""
-            if len(body) < 30: continue
+
+            # Filtreye takılanları atla
+            if any(bad in link for bad in ignored_domains):
+                continue
+
+            if len(body) < 30:
+                continue
+
+            # link eklemek kanıt kalitesini artırıyor
             results.append(f"- {title}: {body} ({link})")
 
         return results[:6]
@@ -111,43 +120,79 @@ def search_web(query):
         return []
 
 def ask_gemini(claim, evidences):
-    if not model: return "Yapay zeka baslatilamadi."
-    if not evidences: return "BELIRSIZ. İnternette net kanit bulamadim."
+    if not model:
+        return "Yapay zeka baslatilamadi. (GEMINI_KEY/model sorunu)"
+    if not evidences:
+        return "BELIRSIZ. İnternette net kanit bulamadim."
 
     evidence_text = "\n".join(evidences)
+
     prompt = f"""
 Sen bir fact-check asistanısın. SADECE aşağıdaki kanıtlara dayan.
+Kanıtlarda olmayan hiçbir şeyi iddia etme, yorum uydurma.
+
 İddia: "{claim}"
+
 Kanıtlar:
 {evidence_text}
 
-Önce kanıtlardan özet çıkar, sonra hüküm ver.
-Format:
+Önce kanıtlardan iddiayla ilgili olan cümleleri 2-4 maddeyle özetle.
+Sonra hüküm ver.
+
+Cevap formatı aynen böyle olacak (başka hiçbir şey yazma):
+
 Özet:
 - ...
+- ...
+
 Hüküm: EVET/HAYIR/BELİRSİZ
-Gerekçe: ...
+Gerekçe: 1-2 cümle.
+
 Kaynaklar:
-1) ...
+1) link
+2) link
 """
     try:
         resp = model.generate_content(prompt)
-        return (resp.text or "").strip()
+        out = (resp.text or "").strip()
+        if not out:
+            return "Yapay zeka bos cevap döndü."
+        return out
     except Exception as e:
         return f"Yapay zeka hatasi: {e}"
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = clean_claim(update.message.text)
-    if len(msg) < 5: return
+    if len(msg) < 5:
+        return
 
     status = await update.message.reply_text("⏳ Bakiyorum...")
-    evidences = await asyncio.to_thread(search_web, msg)
-    answer = await asyncio.to_thread(ask_gemini, msg, evidences)
+
+    for attempt in range(2):  # 2 deneme
+        evidences = await asyncio.to_thread(search_web, msg)
+        answer = await asyncio.to_thread(ask_gemini, msg, evidences)
+
+        if answer.startswith("Yapay zeka") or answer.startswith("BELIRSIZ."):
+            try:
+                await status.edit_text(answer, disable_web_page_preview=True)
+            except:
+                await update.message.reply_text(answer, disable_web_page_preview=True)
+            return
+
+        if "Özet:" in answer and "Hüküm:" in answer:
+            try:
+                await status.edit_text(answer, disable_web_page_preview=True)
+            except:
+                await update.message.reply_text(answer, disable_web_page_preview=True)
+            return
 
     try:
-        await status.edit_text(answer, disable_web_page_preview=True)
+        await status.edit_text(
+            "BELIRSIZ. Kanitlar net degil kanka, biraz daha acik yaz.",
+            disable_web_page_preview=True
+        )
     except:
-        await update.message.reply_text(answer, disable_web_page_preview=True)
+        pass
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Hazirim! Idiani yaz.")
@@ -156,8 +201,10 @@ def main():
     if not TG_TOKEN:
         print("HATA: TELEGRAM_BOT_TOKEN Render ayarlarinda yok!")
         return
+
     keep_alive()
     setup_ai()
+
     tg_app = ApplicationBuilder().token(TG_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

@@ -44,14 +44,13 @@ def setup_ai():
     try:
         genai.configure(api_key=GEMINI_KEY)
 
-        # Deneysel (exp) modelleri eledik, sadece kararlı olanlar
+        # Deneysel (exp) modelleri eledik
         preferred = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
         available = [
             m.name for m in genai.list_models()
             if "generateContent" in getattr(m, "supported_generation_methods", [])
         ]
 
-        # Listeden exp olmayan, preferred içindeki ilk modeli seç
         picked = next(
             (a for p in preferred for a in available if p in a and "exp" not in a),
             available[0] if available else None
@@ -76,126 +75,100 @@ def clean_claim(text: str) -> str:
     return text
 
 def search_web(query):
-    """FİLTRELİ ARAMA: Banka ve reklam sitelerini eler."""
+    """ÖNCE HABERLERDE, SONRA WEBDE ARA"""
+    results = []
     try:
         with DDGS() as ddgs:
-            # Sorguyu güçlendir
-            enhanced_query = f"{query} haber gerçek mi"
-            
-            ddg_results = list(ddgs.text(
-                enhanced_query,
+            # 1. Aşama: SADECE HABERLERİ ARA (News Search)
+            # Bu mod saçma siteleri getirmez, sadece gazeteleri getirir.
+            news_results = list(ddgs.news(
+                query,
                 region="tr-tr",
                 safesearch="moderate",
-                max_results=8
+                max_results=5
             ))
+            
+            for r in news_results:
+                title = r.get("title", "")
+                body = r.get("body", "") # Haberlerde body genelde özet olur
+                link = r.get("url") or r.get("href", "")
+                source = r.get("source", "") # Haber kaynağı (Hürriyet, BBC vs.)
+                
+                results.append(f"- [{source}] {title}: {body} ({link})")
 
-        results = []
-        
-        # --- YENİ EKLENEN FİLTRE BURASI ---
-        ignored_domains = [
-            "dcu.org", "apple.com", "google.com", "amazon.com", 
-            "trendyol.com", "hepsiburada.com", "sahibinden.com", 
-            "pinterest.com", "akakce.com", "cimri.com"
-        ]
-        # ----------------------------------
+            # 2. Aşama: Eğer haber çıkmazsa normal aramaya dön (Yedek)
+            if len(results) < 2:
+                text_results = list(ddgs.text(
+                    f"{query} haber",
+                    region="tr-tr",
+                    safesearch="moderate",
+                    max_results=3
+                ))
+                for r in text_results:
+                    title = r.get("title", "")
+                    body = r.get("body", "")
+                    link = r.get("href", "")
+                    if len(body) > 20:
+                        results.append(f"- {title}: {body} ({link})")
 
-        for r in ddg_results:
-            title = r.get("title", "")
-            body = r.get("body", "")
-            link = r.get("href") or r.get("link") or ""
-
-            # Filtreye takılanları atla
-            if any(bad in link for bad in ignored_domains):
-                continue
-
-            if len(body) < 30:
-                continue
-
-            # link eklemek kanıt kalitesini artırıyor
-            results.append(f"- {title}: {body} ({link})")
-
-        return results[:6]
+        return results[:8] # En iyi 8 sonucu döndür
     except Exception as e:
-        print("DDG hata:", e)
+        print("Arama hatasi:", e)
         return []
 
 def ask_gemini(claim, evidences):
-    if not model:
-        return "Yapay zeka baslatilamadi. (GEMINI_KEY/model sorunu)"
-    if not evidences:
-        return "BELIRSIZ. İnternette net kanit bulamadim."
+    if not model: return "Yapay zeka baslatilamadi."
+    if not evidences: return "BELIRSIZ. Konuyla ilgili güvenilir haber bulunamadı."
 
     evidence_text = "\n".join(evidences)
 
     prompt = f"""
-Sen bir fact-check asistanısın. SADECE aşağıdaki kanıtlara dayan.
-Kanıtlarda olmayan hiçbir şeyi iddia etme, yorum uydurma.
+Sen profesyonel bir teyitçisin (fact-checker). 
+Sadece aşağıdaki **HABER KAYNAKLARINA** dayanarak iddiayı analiz et.
 
 İddia: "{claim}"
 
-Kanıtlar:
+Bulunan Haberler/Kaynaklar:
 {evidence_text}
 
-Önce kanıtlardan iddiayla ilgili olan cümleleri 2-4 maddeyle özetle.
-Sonra hüküm ver.
+GÖREVİN:
+1. Kaynaklar iddiayı doğruluyor mu, yalanlıyor mu yoksa konuyla alakasız mı?
+2. Eğer kaynaklar alakasızsa (örn: banka reklamı vs.) "BELİRSİZ" de.
+3. Asla kendi fikrini katma.
 
-Cevap formatı aynen böyle olacak (başka hiçbir şey yazma):
-
+CEVAP FORMATI:
 Özet:
-- ...
-- ...
+- (Haberlerden kısa maddeler)
 
-Hüküm: EVET/HAYIR/BELİRSİZ
-Gerekçe: 1-2 cümle.
-
+Hüküm: EVET / HAYIR / BELİRSİZ / İDDİA (Sadece iddia aşamasında ise)
+Gerekçe: (1 cümle)
 Kaynaklar:
-1) link
-2) link
+1) ...
 """
     try:
         resp = model.generate_content(prompt)
         out = (resp.text or "").strip()
-        if not out:
-            return "Yapay zeka bos cevap döndü."
+        if not out: return "Cevap üretilemedi."
         return out
     except Exception as e:
         return f"Yapay zeka hatasi: {e}"
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = clean_claim(update.message.text)
-    if len(msg) < 5:
-        return
+    if len(msg) < 5: return
 
-    status = await update.message.reply_text("⏳ Bakiyorum...")
+    status = await update.message.reply_text("📰 Haber kaynakları taranıyor...")
 
-    for attempt in range(2):  # 2 deneme
-        evidences = await asyncio.to_thread(search_web, msg)
-        answer = await asyncio.to_thread(ask_gemini, msg, evidences)
-
-        if answer.startswith("Yapay zeka") or answer.startswith("BELIRSIZ."):
-            try:
-                await status.edit_text(answer, disable_web_page_preview=True)
-            except:
-                await update.message.reply_text(answer, disable_web_page_preview=True)
-            return
-
-        if "Özet:" in answer and "Hüküm:" in answer:
-            try:
-                await status.edit_text(answer, disable_web_page_preview=True)
-            except:
-                await update.message.reply_text(answer, disable_web_page_preview=True)
-            return
+    evidences = await asyncio.to_thread(search_web, msg)
+    answer = await asyncio.to_thread(ask_gemini, msg, evidences)
 
     try:
-        await status.edit_text(
-            "BELIRSIZ. Kanitlar net degil kanka, biraz daha acik yaz.",
-            disable_web_page_preview=True
-        )
+        await status.edit_text(answer, disable_web_page_preview=True)
     except:
-        pass
+        await update.message.reply_text(answer, disable_web_page_preview=True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hazirim! Idiani yaz.")
+    await update.message.reply_text("Hazırım! Bir iddia veya haber başlığı yaz.")
 
 def main():
     if not TG_TOKEN:
